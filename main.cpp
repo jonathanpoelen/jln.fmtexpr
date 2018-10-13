@@ -3,11 +3,13 @@
 #include <kvasir/mpl/algorithm/flatten.hpp>
 #include <kvasir/mpl/algorithm/fold_left.hpp>
 #include <kvasir/mpl/algorithm/remove_adjacent.hpp>
+#include <kvasir/mpl/functions/comparison/greater_than.hpp>
 #include <kvasir/mpl/functional/bind.hpp>
 #include <kvasir/mpl/functional/call.hpp>
-#include <kvasir/mpl/functional/compose.hpp>
 #include <kvasir/mpl/functional/fork.hpp>
+#include <kvasir/mpl/functional/compose.hpp>
 #include <kvasir/mpl/sequence/front.hpp>
+#include <kvasir/mpl/sequence/at.hpp>
 #include <kvasir/mpl/sequence/join.hpp>
 #include <kvasir/mpl/sequence/pop_front.hpp>
 #include <kvasir/mpl/sequence/push_back.hpp>
@@ -47,6 +49,8 @@
 #include <string_view>
 
 #define JLN_FWD(t, x) static_cast<t&&>(x)
+#define JLN_MOVE(x) ::std::move(x)
+#define JLN_TYPE(x) ::std::remove_reference_t<decltype(x)>
 
 namespace jln::fmtexpr
 {
@@ -57,11 +61,35 @@ namespace jln::fmtexpr
   {
     using kmp::list;
 
-    template<class F, class... Ts>
-    using eager = typename F::template f<Ts...>;
-
     template<class... Ls>
     using join = typename kmp::join<kmp::listify>::template f<Ls...>;
+
+    template<class, class>
+    struct push_unique_partition;
+
+    template<class... Ts, class... Us, class T>
+    struct push_unique_partition<list<list<Ts...>, list<Us...>>, T>
+    {
+      using cond = kmp::conditional<(std::is_same<T, Ts>::value || ...)>;
+      using type = list<
+        typename cond
+        ::template f<kmp::pop_front<>, kmp::rotate<kmp::int_<1>>>
+        ::template f<T, Ts...>,
+        typename cond
+        ::template f<kmp::rotate<kmp::int_<1>>, kmp::pop_front<>>
+        ::template f<T, Us...>
+      >;
+    };
+
+    template<class C = kmp::listify>
+    struct unique_partition
+    {
+      template<class... Ts>
+      using f = typename kmp::fold_left<
+        kmp::cfl<push_unique_partition>,
+        kmp::unpack<C>
+      >::template f<list<list<>, list<>>, Ts...>;
+    };
 
     template<class, class>
     struct push_back_if_not_found;
@@ -84,12 +112,25 @@ namespace jln::fmtexpr
       >::template f<L, Ts...>;
     };
 
+    template<>
+    struct unique_append<kmp::listify>
+    {
+      template<class L, class... Ts>
+      using f = typename kmp::fold_left<
+        kmp::cfl<push_back_if_not_found>,
+        kmp::identity
+      >::template f<L, Ts...>;
+    };
+
     template<class C = kmp::listify>
     struct unique
     {
       template<class... Ts>
       using f = typename unique_append<C>::template f<list<>, Ts...>;
     };
+
+    template<class C, class... Fs>
+    using fix = kmp::fork<Fs..., C>;
   }
 
   namespace detail
@@ -120,7 +161,7 @@ namespace jln::fmtexpr
   using get_deps = detail::extract_type_t<dep_list_t, T, kmp::list<>>;
 
   template<class... Ts>
-  using get_deps_xs = mp::join<get_deps<Ts>...>;
+  using get_deps_xs = kmp::call<kmp::join<mp::unique<>>, get_deps<Ts>...>;
 
   template<class T>
   using get_desc = detail::extract_type_t<desc_type_t, T, void>;
@@ -435,17 +476,25 @@ namespace jln::fmtexpr::ext::print
       ((std::cout << detail::get_type_name<Ts>() << "  "), ...);
     }
 
+    template<class L>
+    void print_deps(char const* name, L l)
+    {
+      std::cout << "  " << name << " (" << kmpe::size<L>::value << "): ";
+      print_deps(l);
+      std::cout << "\n";
+    }
+
     template<class Value>
     void print_element(Value const& value)
     {
       using fmtexpr_or_type = get_fmtexpr_or_type<Value>;
       std::cout << get_type_name<Value>() << "\n";
-      if (!std::is_same_v<fmtexpr_or_type, Value>)
+      if constexpr (!std::is_same_v<fmtexpr_or_type, Value>)
       {
         std::cout << "  fmtexpr type: " << get_type_name<fmtexpr_or_type>() << "\n";
       }
       std::cout << "  linked to: " << get_type_name<get_binded_variable<Value>>() << "\n";
-      std::cout << "  dependencies (" << kmpe::size<get_deps<Value>>::value << "): "; print_deps(get_deps<Value>{}); std::cout << "\n";
+      print_deps("dependencies", get_deps<Value>{});
       std::cout << "  description: " << get_type_name<get_desc<Value>>() << "\n";
       if constexpr (is_value_v<fmtexpr_or_type>)
       {
@@ -468,31 +517,160 @@ namespace jln::fmtexpr::ext::print
     }
   }
 
+  namespace detail
+  {
+    template<class... Errors>
+    struct check_error : Errors...
+    {
+      template<class C, class... Ts>
+      using f = kmp::call<C, Ts...>;
+    };
+  }
+
+  template<template<class...> class Error>
+  using check_error = kmp::eager::compose<detail::check_error, Error>;
+
+  namespace errors
+  {
+#define MAKE_ERROR(name, ...)                          \
+    template<class... Ts> struct name                  \
+    { static_assert(!sizeof...(Ts) ,##__VA_ARGS__); }; \
+    using name##_f = kmp::cfe<name>
+
+    MAKE_ERROR(duplicate_parameter, "call made with multiple times the same parameter");
+    MAKE_ERROR(missing_parameter, "missing parameter");
+  }
+
+  template<class C = kmp::listify>
+  struct get_unsatisfactory_deps
+  {
+    template<class UniqueDeps, class... Ts>
+    using f = kmp::call<
+      mp::unique_append<kmp::drop<kmpe::size<UniqueDeps>, C>>,
+      UniqueDeps, Ts...>;
+  };
+
+  template<template<class...> class Error>
+  struct calll
+  {
+    template<class... Ts>
+    struct t
+    {
+      using f = Error<Ts...>;
+    };
+
+    template<class... Ts>
+    using f = t<Ts...>;
+  };
+
+  template<class C, class... Errors>
+  struct return_and_check
+  {
+    template<class... Ts>
+    using f = kmp::call<
+      detail::check_error<kmp::call<Errors, Ts...>...>,
+      C, Ts...>;
+  };
+
+  template<class... Errors>
+  using check = return_and_check<kmp::identity, Errors...>;
+
   template<class Pack>
   void introspection(Pack const& pack)
   {
     my_apply(pack, [](auto&... xs){
       (detail::print_element(xs), ...);
 
-#define T(x) std::remove_reference_t<decltype(x)>
-      using deps = mp::eager<
-        kmp::join<mp::unique<>>,
-        get_deps<T(xs)>...>;
-      using satisfactory_deps = mp::eager<
-        kmp::remove_if<kmp::same_as<void>, mp::unique<>>,
-        get_binded_variable<T(xs)>...>;
-      using unsatisfactory_deps = mp::eager<
-        kmp::unpack<mp::unique_append<kmp::drop<kmpe::size<satisfactory_deps>>>>, deps, satisfactory_deps>;
-#undef T
+      using deps = get_deps_xs<JLN_TYPE(xs)...>;
 
-      std::cout << "dependencies (" << kmpe::size<deps>::value << "): ";
-      detail::print_deps(deps{}); std::cout << "\n";
+      using satisfactory_deps = kmp::call<
+        kmp::remove_if<kmp::same_as<void>>,
+        get_binded_variable<JLN_TYPE(xs)>...>;
 
-      std::cout << "satisfactory dependencies (" << kmpe::size<satisfactory_deps>::value << "): ";
-      detail::print_deps(satisfactory_deps{}); std::cout << "\n";
+      using satisfactory_deps_partition = kmp::call<
+        kmp::unpack<mp::unique_partition<>>,
+        satisfactory_deps>;
 
-      std::cout << "unsatisfactory dependencies (" << kmpe::size<unsatisfactory_deps>::value << "): ";
-      detail::print_deps(unsatisfactory_deps{}); std::cout << "\n";
+      using unique_satisfactory_deps = kmp::call<
+        kmp::unpack<kmp::at0<>>,
+        satisfactory_deps_partition>;
+
+      using duplicated_satisfactory_deps = kmp::call<
+        kmp::unpack<kmp::at1<>>,
+        satisfactory_deps_partition>;
+
+      using unsatisfactory_deps = kmp::call<kmp::unpack<
+        mp::unique_append<kmp::drop<kmpe::size<unique_satisfactory_deps>>>>,
+        deps, unique_satisfactory_deps>;
+
+      /*using unique_satisfactory_deps = kmp::call<
+        kmp::unpack<mp::unique_partition<
+          kmp::cfe<check_and_return_satisfactory_deps>>>,
+        satisfactory_deps>{};*/
+
+      // using checker = kmp::call<
+      //   kmp::unpack<kmp::cfe<error::duplicate_param>>,
+      //   duplicated_satisfactory_deps>;
+      //
+      // checker();
+
+      detail::print_deps("dependencies", deps{});
+      detail::print_deps("satisfactory dependencies", unique_satisfactory_deps{});
+      detail::print_deps("duplicated satisfactory dependencies", duplicated_satisfactory_deps{});
+      detail::print_deps("unsatisfactory dependencies", unsatisfactory_deps{});
+      detail::print_deps("unsatisfactory dependencies2",
+        kmp::call<kmp::unpack<
+        get_unsatisfactory_deps<>>, deps, unique_satisfactory_deps>{});
+      detail::print_deps("unsatisfactory dependencies3",
+        kmp::call<kmp::unpack<
+          kmp::fork_front<
+            kmp::always<unique_satisfactory_deps>,
+            get_unsatisfactory_deps<>
+          >
+        >, deps>{});
+    });
+  }
+
+  namespace detail
+  {
+    template<class T, class Pack, class... Ts>
+    void stringify_element(T const& x, Pack const& /*pack*/, kmp::list<Ts...>)
+    {
+      std::cout << get_type_name<T>() << ":";
+      ((std::cout << "  " << get_type_name<Ts>()), ...);
+      std::cout << "\n";
+    }
+  }
+
+  template<class Pack>
+  void stringify(Pack const& pack)
+  {
+    my_apply(pack, [&](auto&... xs){
+      using satisfactory_deps = kmp::call<
+        kmp::remove_if<
+          kmp::same_as<void>,
+          mp::unique_partition<
+            return_and_check<
+              kmp::at0<>,
+              kmp::at1<kmp::unpack<errors::duplicate_parameter_f>>
+            >
+          >
+        >,
+        get_binded_variable<JLN_TYPE(xs)>...>;
+
+      using missing_deps = kmp::call<
+        kmp::join<mp::unique<kmp::fork_front<
+          kmp::always<satisfactory_deps>,
+          get_unsatisfactory_deps<
+            return_and_check<
+              kmp::always<void>/*kmp::listify*/,
+              errors::missing_parameter_f
+            >
+          >
+        >>>,
+        get_deps<JLN_TYPE(xs)>...>;
+
+      (detail::stringify_element(xs, pack, get_deps<JLN_TYPE(xs)>{}), ...);
     });
   }
 }
@@ -516,11 +694,12 @@ int main(/*int argc, char **argv*/)
   auto packet = pack(
     0, int_, int_(i), int_(0),
     a, a(1),
-    a, a(1),
-    b, /*b(2),*/
+    // a, a(1),
+    b, b(2),
     c, c(i),
     d, d(4),
     e
   );
   introspection(packet);
+  stringify(packet);
 }
